@@ -5,29 +5,35 @@ services:
     build: .
     command: python deploy/rotator.py
     environment:
-      # DATABASE_URL must be provided in .env or deployment config
       - DATABASE_URL=${DATABASE_URL}
-      # Optional: Set initial cookies here for the first run
-      # - INIT_SECURE_1PSID=...
-      # - INIT_SECURE_1PSIDTS=...
     networks:
       - gemini_net
-    restart: always
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: [ node.role == manager ]
+      restart_policy:
+        condition: on-failure
 
   worker:
     build: .
     command: uvicorn deploy.worker:app --host 0.0.0.0 --port 8000
     environment:
-      # DATABASE_URL must be provided in .env or deployment config
       - DATABASE_URL=${DATABASE_URL}
     ports:
       - "8000:8000"
     networks:
       - gemini_net
-    restart: always
     deploy:
+      mode: replicated
       replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
 
 networks:
   gemini_net:
-    driver: bridge
+    driver: overlay
