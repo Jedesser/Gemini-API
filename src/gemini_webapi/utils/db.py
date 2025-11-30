@@ -79,6 +79,20 @@ async def get_all_active_cookies() -> list[dict]:
             for r in rows
         ]
 
+async def set_cookie_active(secure_1psid: str, is_active: bool):
+    """
+    Set the active status of a cookie session.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE gemini_sessions 
+            SET is_active = $2, updated_at = NOW()
+            WHERE secure_1psid = $1
+        """, secure_1psid, is_active)
+        state = "active" if is_active else "inactive"
+        logger.info(f"Marked session {secure_1psid[:10]}... as {state}")
+
 async def close_db():
     """
     Close the database pool.
