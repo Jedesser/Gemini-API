@@ -9,7 +9,6 @@ authors = [
 ]
 description = "✨ An elegant async Python wrapper for Google Gemini web app"
 readme = "README.md"
-license = {file = "LICENSE"}
 keywords = ["API", "async", "Gemini", "Bard", "Google", "Generative AI", "LLM"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -24,6 +23,7 @@ dependencies = [
     "loguru~=0.7.3",
     "orjson~=3.11.1",
     "pydantic~=2.12.2",
+    "asyncpg~=0.29.0",
 ]
 dynamic = ["version"]
 

@@ -88,17 +88,12 @@ async def get_access_token(
             "Skipping loading base cookies. Either __Secure-1PSID or __Secure-1PSIDTS is not provided."
         )
 
-    # Cached cookies in local file
-    cache_dir = (
-        (GEMINI_COOKIE_PATH := os.getenv("GEMINI_COOKIE_PATH"))
-        and Path(GEMINI_COOKIE_PATH)
-        or (Path(__file__).parent / "temp")
-    )
-    if "__Secure-1PSID" in base_cookies:
-        filename = f".cached_1psidts_{base_cookies['__Secure-1PSID']}.txt"
-        cache_file = cache_dir / filename
-        if cache_file.is_file():
-            cached_1psidts = cache_file.read_text()
+    # Cached cookies in DB
+    try:
+        from .db import get_cookie, get_all_active_cookies
+        
+        if "__Secure-1PSID" in base_cookies:
+            cached_1psidts = await get_cookie(base_cookies["__Secure-1PSID"])
             if cached_1psidts:
                 cached_cookies = {
                     **extra_cookies,
@@ -107,27 +102,21 @@ async def get_access_token(
                 }
                 tasks.append(Task(send_request(cached_cookies, proxy=proxy)))
             elif verbose:
-                logger.debug("Skipping loading cached cookies. Cache file is empty.")
-        elif verbose:
-            logger.debug("Skipping loading cached cookies. Cache file not found.")
-    else:
-        valid_caches = 0
-        cache_files = cache_dir.glob(".cached_1psidts_*.txt")
-        for cache_file in cache_files:
-            cached_1psidts = cache_file.read_text()
-            if cached_1psidts:
+                logger.debug("Skipping loading cached cookies. No active session found in DB.")
+        else:
+            active_cookies_list = await get_all_active_cookies()
+            for cookie_data in active_cookies_list:
                 cached_cookies = {
                     **extra_cookies,
-                    "__Secure-1PSID": cache_file.stem[16:],
-                    "__Secure-1PSIDTS": cached_1psidts,
+                    **cookie_data,
                 }
                 tasks.append(Task(send_request(cached_cookies, proxy=proxy)))
-                valid_caches += 1
+            
+            if not active_cookies_list and verbose:
+                logger.debug("Skipping loading cached cookies. Database is empty.")
 
-        if valid_caches == 0 and verbose:
-            logger.debug(
-                "Skipping loading cached cookies. Cookies will be cached after successful initialization."
-            )
+    except Exception as e:
+        logger.warning(f"Failed to load cookies from DB: {e}")
 
     # Browser cookies (if browser-cookie3 is installed)
     try:

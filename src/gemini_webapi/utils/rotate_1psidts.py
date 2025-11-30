@@ -32,28 +32,27 @@ async def rotate_1psidts(cookies: dict, proxy: str | None = None) -> str:
         If request failed with other status codes.
     """
 
-    path = (
-        (GEMINI_COOKIE_PATH := os.getenv("GEMINI_COOKIE_PATH"))
-        and Path(GEMINI_COOKIE_PATH)
-        or (Path(__file__).parent / "temp")
-    )
-    path.mkdir(parents=True, exist_ok=True)
-    filename = f".cached_1psidts_{cookies['__Secure-1PSID']}.txt"
-    path = path / filename
+    try:
+        from .db import upsert_cookie
+    except ImportError:
+        # Fallback or error if db module is missing/failing, but we assume it exists
+        raise
 
-    # Check if the cache file was modified in the last minute to avoid 429 Too Many Requests
-    if not (path.is_file() and time.time() - os.path.getmtime(path) <= 60):
-        async with AsyncClient(http2=True, proxy=proxy) as client:
-            response = await client.post(
-                url=Endpoint.ROTATE_COOKIES.value,
-                headers=Headers.ROTATE_COOKIES.value,
-                cookies=cookies,
-                data='[000,"-0000000000000000000"]',
-            )
-            if response.status_code == 401:
-                raise AuthError
-            response.raise_for_status()
+    # We proceed to rotate without checking local file timestamp for now, 
+    # assuming the caller (auto_refresh loop) handles the interval.
+    async with AsyncClient(http2=True, proxy=proxy) as client:
+        response = await client.post(
+            url=Endpoint.ROTATE_COOKIES.value,
+            headers=Headers.ROTATE_COOKIES.value,
+            cookies=cookies,
+            data='[000,"-0000000000000000000"]',
+        )
+        if response.status_code == 401:
+            raise AuthError
+        response.raise_for_status()
 
-            if new_1psidts := response.cookies.get("__Secure-1PSIDTS"):
-                path.write_text(new_1psidts)
-                return new_1psidts
+        if new_1psidts := response.cookies.get("__Secure-1PSIDTS"):
+            # Save to DB instead of file
+            await upsert_cookie(cookies['__Secure-1PSID'], new_1psidts)
+            return new_1psidts
+
