@@ -173,6 +173,12 @@ def run_api():
             refresh_interval=refresh_interval,
         )
         
+        # Запуск автоматической перезагрузки конфига (если включено)
+        config_watch_interval = int(os.getenv("GEMINI_CONFIG_WATCH_INTERVAL", "900"))  # 15 мин
+        if config_watch_interval > 0 and accounts_file:
+            await pool.start_config_watcher(check_interval=config_watch_interval)
+            print(f"👁️ Config watcher запущен (интервал: {config_watch_interval}с)")
+        
         app.state.pool = pool
         
         health = pool.get_health_status()

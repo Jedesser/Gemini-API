@@ -92,12 +92,20 @@ class ClientPool:
         self._lock = asyncio.Lock()
         self._account_order: list[str] = []  # Для round-robin
         self._state_dir: Optional[Path] = None
+        self._config_path: Optional[Path] = None
+        self._config_mtime: float = 0
+        self._watcher_task: Optional[asyncio.Task] = None
+        self._init_params: dict = {}  # Параметры инициализации для hot-reload
     
     def load_config(self, config_path: str | Path) -> None:
         """Загружает конфигурацию аккаунтов из JSON файла."""
         path = Path(config_path)
         if not path.exists():
             raise FileNotFoundError(f"Accounts config not found: {path}")
+        
+        # Сохраняем путь и время модификации
+        self._config_path = path
+        self._config_mtime = path.stat().st_mtime
         
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -122,6 +130,7 @@ class ClientPool:
             self._account_order.append(config.id)
         
         logger.info(f"Loaded {len(self.accounts)} accounts from config")
+
     
     def add_account_from_env(self, psid: str, psidts: Optional[str] = None, 
                               proxy: Optional[str] = None) -> None:
@@ -144,6 +153,13 @@ class ClientPool:
         refresh_interval: float = 540,
     ) -> None:
         """Инициализирует все клиенты в пуле."""
+        # Сохраняем параметры для hot-reload
+        self._init_params = {
+            "timeout": timeout,
+            "auto_refresh": auto_refresh,
+            "refresh_interval": refresh_interval,
+        }
+        
         init_tasks = []
         
         for account_id, state in self.accounts.items():
@@ -176,12 +192,61 @@ class ClientPool:
         healthy_count = sum(1 for s in self.accounts.values() if s.healthy)
         logger.info(f"Pool initialized: {healthy_count}/{len(self.accounts)} accounts healthy")
     
+    async def start_config_watcher(self, check_interval: float = 900) -> None:
+        """
+        Запускает фоновую задачу для автоматической перезагрузки конфига.
+        
+        Args:
+            check_interval: Интервал проверки в секундах (по умолчанию 15 минут = 900 сек)
+        """
+        if not self._config_path:
+            logger.warning("Config watcher not started: no config file loaded")
+            return
+        
+        async def watcher_loop():
+            while True:
+                await asyncio.sleep(check_interval)
+                
+                try:
+                    if not self._config_path.exists():
+                        continue
+                    
+                    current_mtime = self._config_path.stat().st_mtime
+                    
+                    if current_mtime > self._config_mtime:
+                        logger.info(f"Config file changed, reloading accounts...")
+                        self._config_mtime = current_mtime
+                        
+                        results = await self.reload_all_from_config(
+                            config_path=self._config_path,
+                            **self._init_params
+                        )
+                        
+                        success = sum(1 for v in results.values() if v)
+                        failed = sum(1 for v in results.values() if not v)
+                        logger.info(f"Auto-reload complete: {success} success, {failed} failed")
+                        
+                except Exception as e:
+                    logger.error(f"Config watcher error: {e}")
+        
+        self._watcher_task = asyncio.create_task(watcher_loop())
+        logger.info(f"Config watcher started (interval: {check_interval}s)")
+    
+    def stop_config_watcher(self) -> None:
+        """Останавливает фоновую задачу мониторинга конфига."""
+        if self._watcher_task:
+            self._watcher_task.cancel()
+            self._watcher_task = None
+            logger.info("Config watcher stopped")
+    
     async def close_all(self) -> None:
-        """Закрывает все клиенты."""
+        """Закрывает все клиенты и останавливает watcher."""
+        self.stop_config_watcher()
         for state in self.accounts.values():
             if state.client:
                 await state.client.close()
         logger.info("All clients closed")
+
     
     def _get_next_healthy(self) -> Optional[AccountState]:
         """Возвращает следующий здоровый аккаунт (Round-Robin)."""
