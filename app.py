@@ -101,7 +101,8 @@ def run_api():
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel, Field
     import uvicorn
-    from gemini_webapi import GeminiClient, set_log_level
+    from gemini_webapi import set_log_level
+    from gemini_webapi.pool import ClientPool
     from contextlib import asynccontextmanager
     
     # Модели запросов/ответов
@@ -109,7 +110,9 @@ def run_api():
         prompt: str = Field(..., min_length=1, description="Текст запроса к Gemini")
         model: Optional[str] = Field(None, description="Модель (gemini-2.5-flash, gemini-2.5-pro и т.д.)")
         aspect_ratio: Optional[str] = Field(None, description="Соотношение сторон (16:9, 4:3, 1:1, etc.)")
-        image_url: Optional[str] = Field(None, description="URL изображения для обработки (будет скачано и отправлено в Gemini)")
+        image_url: Optional[str] = Field(None, description="[DEPRECATED] Одиночный URL изображения. Используйте image_urls.")
+        image_urls: Optional[list[str]] = Field(None, description="Массив URL изображений для обработки")
+        account_id: Optional[str] = Field(None, description="Явный выбор аккаунта (опционально, по умолчанию Round-Robin)")
         
     class AskResponse(BaseModel):
         text: str = Field(..., description="Текстовый ответ от Gemini")
@@ -131,45 +134,56 @@ def run_api():
     # Lifecycle management
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """Инициализация и закрытие клиента"""
+        """Инициализация и закрытие пула клиентов"""
         # Startup
         log_level = os.getenv("LOG_LEVEL", "INFO")
         set_log_level(log_level)
         
-        psid = os.getenv("GEMINI_PSID")
-        psidts = os.getenv("GEMINI_PSIDTS")
-        proxy = os.getenv("GEMINI_PROXY")
+        # Создаём пул
+        pool = ClientPool()
         
-        if not psid:
-            raise RuntimeError("GEMINI_PSID не установлен в переменных окружения!")
+        # Загрузка конфигурации
+        accounts_file = os.getenv("GEMINI_ACCOUNTS_FILE")
+        if accounts_file and os.path.exists(accounts_file):
+            # Новый режим: загрузка из JSON
+            pool.load_config(accounts_file)
+            print(f"📂 Загружена конфигурация из {accounts_file}")
+        else:
+            # Обратная совместимость: ENV переменные
+            psid = os.getenv("GEMINI_PSID")
+            psidts = os.getenv("GEMINI_PSIDTS")
+            proxy = os.getenv("GEMINI_PROXY")
+            
+            if not psid:
+                raise RuntimeError(
+                    "Укажите GEMINI_ACCOUNTS_FILE или GEMINI_PSID в переменных окружения!"
+                )
+            
+            pool.add_account_from_env(psid=psid, psidts=psidts, proxy=proxy)
+            print("📋 Используется аккаунт из ENV переменных")
         
-        # Используем app.state вместо глобальной переменной
-        app.state.gemini_client = GeminiClient(
-            secure_1psid=psid,
-            secure_1psidts=psidts,
-            proxy=proxy
-        )
-        
+        # Инициализация всех клиентов
         timeout = int(os.getenv("GEMINI_TIMEOUT", "120"))
         auto_refresh = os.getenv("GEMINI_AUTO_REFRESH", "true").lower() == "true"
         refresh_interval = int(os.getenv("GEMINI_REFRESH_INTERVAL", "540"))
         
-        await app.state.gemini_client.init(
+        await pool.init_all(
             timeout=timeout,
-            auto_close=False,
             auto_refresh=auto_refresh,
             refresh_interval=refresh_interval,
-            verbose=True
         )
         
-        print("✅ FastAPI сервер запущен, Gemini клиент инициализирован")
+        app.state.pool = pool
+        
+        health = pool.get_health_status()
+        print(f"✅ FastAPI сервер запущен. Пул: {health['healthy']}/{health['total']} аккаунтов активно")
         
         yield
         
         # Shutdown
-        if hasattr(app.state, 'gemini_client') and app.state.gemini_client:
-            await app.state.gemini_client.close()
-            print("✅ Gemini клиент закрыт")
+        if hasattr(app.state, 'pool') and app.state.pool:
+            await app.state.pool.close_all()
+            print("✅ Все клиенты закрыты")
     
     # Установка lifespan ПОСЛЕ создания app
     app.router.lifespan_context = lifespan
@@ -223,79 +237,67 @@ def run_api():
         }
         ```
         """
-        # Используем app.state вместо global
-        gemini_client = request.app.state.gemini_client
+        pool: ClientPool = request.app.state.pool
         
-        # Детальная проверка состояния клиента
-        print(f"🔍 Проверка клиента:")
-        print(f"   gemini_client is None: {gemini_client is None}")
-        if gemini_client:
-            print(f"   gemini_client._running: {gemini_client._running}")
+        if not pool or not pool.accounts:
+            raise HTTPException(status_code=503, detail="Пул клиентов не инициализирован")
         
-        if not gemini_client:
-            print(f"❌ Клиент = None")
-            raise HTTPException(status_code=503, detail="Gemini клиент не инициализирован")
-        
-        if not gemini_client._running:
-            print(f"❌ Клиент не в режиме running")
-            raise HTTPException(status_code=503, detail="Gemini клиент не активен")
-        
-        # Проверяем, что клиент запущен, если нет - переинициализируем
-        if not gemini_client._running:
-            print("⚠️ Клиент не активен, переинициализация...")
-            try:
-                timeout = int(os.getenv("GEMINI_TIMEOUT", "120"))
-                auto_refresh = os.getenv("GEMINI_AUTO_REFRESH", "true").lower() == "true"
-                refresh_interval = int(os.getenv("GEMINI_REFRESH_INTERVAL", "540"))
-                
-                await gemini_client.init(
-                    timeout=timeout,
-                    auto_refresh=auto_refresh,
-                    refresh_interval=refresh_interval,
-                    verbose=True
-                )
-                print("✅ Клиент успешно переинициализирован")
-            except Exception as reinit_error:
-                print(f"❌ Ошибка реинициализации клиента: {reinit_error}")
-                raise HTTPException(status_code=503, detail="Gemini client unavailable and failed to reinitialize")
+        health = pool.get_health_status()
+        if health["healthy"] == 0:
+            raise HTTPException(status_code=503, detail="Все аккаунты недоступны")
         
         try:
             print(f"📤 Отправка запроса в Gemini: {ask_request.prompt[:50]}...")
             
-            # Скачивание изображения если указан image_url
-            temp_image_path = None
-            if ask_request.image_url:
-                print(f"📥 Скачивание изображения: {ask_request.image_url[:50]}...")
-                try:
-                    from httpx import AsyncClient as HttpxAsyncClient
-                    import tempfile
-                    import os
-                    
-                    async with HttpxAsyncClient(timeout=30.0) as http_client:
-                        img_response = await http_client.get(ask_request.image_url)
-                        img_response.raise_for_status()
-                        
-                        # Определяем расширение из Content-Type или URL
-                        content_type = img_response.headers.get("content-type", "")
-                        if "jpeg" in content_type or "jpg" in content_type:
-                            ext = ".jpg"
-                        elif "png" in content_type:
-                            ext = ".png"
-                        elif "webp" in content_type:
-                            ext = ".webp"
-                        else:
-                            # Попробуем из URL
-                            ext = os.path.splitext(ask_request.image_url)[1] or ".jpg"
-                        
-                        # Сохраняем во временный файл
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
-                            tmp_file.write(img_response.content)
-                            temp_image_path = tmp_file.name
-                        
-                        print(f"✅ Изображение сохранено: {temp_image_path}")
-                except Exception as download_error:
-                    print(f"⚠️ Ошибка скачивания изображения: {download_error}")
-                    raise HTTPException(status_code=400, detail=f"Failed to download image: {str(download_error)}")
+            # Сбор всех URL изображений (поддержка как image_url, так и image_urls)
+            all_image_urls: list[str] = []
+            if ask_request.image_urls:
+                all_image_urls.extend(ask_request.image_urls)
+            if ask_request.image_url and ask_request.image_url not in all_image_urls:
+                all_image_urls.append(ask_request.image_url)
+            
+            # Скачивание всех изображений
+            temp_image_paths: list[str] = []
+            if all_image_urls:
+                print(f"📥 Скачивание {len(all_image_urls)} изображений...")
+                from httpx import AsyncClient as HttpxAsyncClient
+                import tempfile
+                
+                async with HttpxAsyncClient(timeout=30.0) as http_client:
+                    for idx, img_url in enumerate(all_image_urls):
+                        try:
+                            print(f"   [{idx+1}/{len(all_image_urls)}] {img_url[:60]}...")
+                            img_response = await http_client.get(img_url)
+                            img_response.raise_for_status()
+                            
+                            # Определяем расширение из Content-Type или URL
+                            content_type = img_response.headers.get("content-type", "")
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = ".jpg"
+                            elif "png" in content_type:
+                                ext = ".png"
+                            elif "webp" in content_type:
+                                ext = ".webp"
+                            elif "gif" in content_type:
+                                ext = ".gif"
+                            else:
+                                ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
+                            
+                            # Сохраняем во временный файл
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
+                                tmp_file.write(img_response.content)
+                                temp_image_paths.append(tmp_file.name)
+                            
+                            print(f"   ✅ Сохранено: {tmp_file.name}")
+                        except Exception as download_error:
+                            print(f"   ⚠️ Ошибка скачивания [{idx+1}]: {download_error}")
+                            # Очистка уже скачанных файлов
+                            for path in temp_image_paths:
+                                try:
+                                    os.unlink(path)
+                                except:
+                                    pass
+                            raise HTTPException(status_code=400, detail=f"Failed to download image {idx+1}: {str(download_error)}")
             
             # Отправка запроса
             kwargs = {}
@@ -303,26 +305,27 @@ def run_api():
                 kwargs["model"] = ask_request.model
             
             # Если указан aspect_ratio, передаем его в client
-            # (теперь поддерживается нативно в client.py)
             if ask_request.aspect_ratio:
                 kwargs["aspect_ratio"] = ask_request.aspect_ratio
             
-            # Если есть изображение, передаем его как файл
-            if temp_image_path:
-                kwargs["files"] = [temp_image_path]
+            # Если есть изображения, передаем их как файлы
+            if temp_image_paths:
+                kwargs["files"] = temp_image_paths
 
-            response = await gemini_client.generate_content(
+            response = await pool.execute(
                 prompt=ask_request.prompt,
+                account_id=ask_request.account_id,
                 **kwargs
             )
             
-            # Удаляем временный файл
-            if temp_image_path and os.path.exists(temp_image_path):
-                try:
-                    os.unlink(temp_image_path)
-                    print(f"🗑️ Временный файл удален: {temp_image_path}")
-                except Exception as del_error:
-                    print(f"⚠️ Не удалось удалить временный файл: {del_error}")
+            # Удаляем временные файлы
+            for temp_path in temp_image_paths:
+                if os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                        print(f"🗑️ Временный файл удален: {temp_path}")
+                    except Exception as del_error:
+                        print(f"⚠️ Не удалось удалить временный файл: {del_error}")
             
             # Обработка изображений: скачивание и конвертация в Base64
             image_data_list = []
@@ -475,18 +478,102 @@ def run_api():
     @app.get("/health", response_model=HealthResponse)
     async def health_check(request: Request):
         """Проверка статуса сервиса"""
-        gemini_client = request.app.state.gemini_client
+        pool: ClientPool = request.app.state.pool
         
-        if gemini_client and gemini_client._running:
-            return HealthResponse(
-                status="healthy",
-                message="Gemini API работает нормально"
-            )
+        if pool:
+            health = pool.get_health_status()
+            if health["healthy"] > 0:
+                return HealthResponse(
+                    status="healthy",
+                    message=f"Gemini API работает: {health['healthy']}/{health['total']} аккаунтов активно"
+                )
         return HealthResponse(
             status="unhealthy",
-            message="Gemini клиент не активен"
+            message="Все аккаунты недоступны"
         )
     
+    @app.get("/health/accounts")
+    async def health_accounts(request: Request):
+        """Детальный статус всех аккаунтов в пуле"""
+        pool: ClientPool = request.app.state.pool
+        
+        if not pool:
+            raise HTTPException(status_code=503, detail="Пул не инициализирован")
+        
+        return pool.get_health_status()
+    
+    # Модель для reload запроса
+    class ReloadRequest(BaseModel):
+        account_id: Optional[str] = Field(None, description="ID аккаунта для перезагрузки (если пусто — перезагрузить все из конфига)")
+        psid: Optional[str] = Field(None, description="Новый PSID (опционально)")
+        psidts: Optional[str] = Field(None, description="Новый PSIDTS (опционально)")
+    
+    @app.post("/admin/reload")
+    async def reload_accounts(request: Request, reload_request: ReloadRequest):
+        """
+        Горячая перезагрузка аккаунтов без остановки сервиса.
+        
+        **Варианты использования:**
+        
+        1. Перезагрузить все из конфига (если он изменился):
+        ```json
+        {}
+        ```
+        
+        2. Перезагрузить конкретный аккаунт с новыми куками:
+        ```json
+        {"account_id": "main", "psid": "new_psid", "psidts": "new_psidts"}
+        ```
+        """
+        pool: ClientPool = request.app.state.pool
+        
+        if not pool:
+            raise HTTPException(status_code=503, detail="Пул не инициализирован")
+        
+        timeout = int(os.getenv("GEMINI_TIMEOUT", "120"))
+        auto_refresh = os.getenv("GEMINI_AUTO_REFRESH", "true").lower() == "true"
+        refresh_interval = int(os.getenv("GEMINI_REFRESH_INTERVAL", "540"))
+        
+        if reload_request.account_id:
+            # Перезагрузить один аккаунт
+            success = await pool.reload_account(
+                account_id=reload_request.account_id,
+                new_psid=reload_request.psid,
+                new_psidts=reload_request.psidts,
+                timeout=timeout,
+                auto_refresh=auto_refresh,
+                refresh_interval=refresh_interval,
+            )
+            return {
+                "action": "reload_single",
+                "account_id": reload_request.account_id,
+                "success": success,
+            }
+        else:
+            # Перезагрузить все из конфига
+            accounts_file = os.getenv("GEMINI_ACCOUNTS_FILE")
+            if not accounts_file:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="GEMINI_ACCOUNTS_FILE не задан. Укажите account_id для перезагрузки конкретного аккаунта."
+                )
+            
+            results = await pool.reload_all_from_config(
+                config_path=accounts_file,
+                timeout=timeout,
+                auto_refresh=auto_refresh,
+                refresh_interval=refresh_interval,
+            )
+            return {
+                "action": "reload_all",
+                "results": results,
+                "summary": {
+                    "total": len(results),
+                    "success": sum(1 for v in results.values() if v),
+                    "failed": sum(1 for v in results.values() if not v),
+                }
+            }
+
     # Запуск сервера
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
