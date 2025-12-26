@@ -16,11 +16,16 @@ services:
       # Путь для сохранения cookies
       GEMINI_COOKIE_PATH: /app/cookies
       # Режим работы: cli или api
-      MODE: ${MODE:-cli}
+      MODE: ${MODE:-api}
+      # Multi-account: путь к конфигу аккаунтов
+      GEMINI_ACCOUNTS_FILE: /config/accounts.json
+      # Интервал автоматической проверки конфига (сек), 0 = отключить
+      GEMINI_CONFIG_WATCH_INTERVAL: ${GEMINI_CONFIG_WATCH_INTERVAL:-900}
 
-    # Volume для персистентности cookies между перезапусками
+    # Volume для персистентности cookies и конфига
     volumes:
       - gemini_cookies:/app/cookies
+      - ./config:/config:ro
       # - ./app.py:/app/app.py # Отключено для production
 
       # Открытие порта только в API режиме

@@ -144,10 +144,18 @@ def run_api():
         
         # Загрузка конфигурации
         accounts_file = os.getenv("GEMINI_ACCOUNTS_FILE")
+        if accounts_file:
+            # Создаём папку если её нет
+            config_dir = os.path.dirname(accounts_file)
+            if config_dir and not os.path.exists(config_dir):
+                os.makedirs(config_dir, exist_ok=True)
+                print(f"📁 Создана папка {config_dir}")
+        
         if accounts_file and os.path.exists(accounts_file):
             # Новый режим: загрузка из JSON
             pool.load_config(accounts_file)
             print(f"📂 Загружена конфигурация из {accounts_file}")
+
         else:
             # Обратная совместимость: ENV переменные
             psid = os.getenv("GEMINI_PSID")

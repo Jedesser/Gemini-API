@@ -202,3 +202,7 @@ Temporary Items
 
 # Temporary files
 .temp/
+
+# Secrets - accounts config with cookies
+config/accounts.json
+accounts.json
